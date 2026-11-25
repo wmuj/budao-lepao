@@ -23,6 +23,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -372,6 +373,42 @@ class CampusRunner:
                     return top
         raise RuntimeError("连续 3 次启动步道乐跑均未进入 MainActivity（当前：%s）" % self._top_activity())
 
+    def _wait_home_ready(self, timeout: float = 25.0) -> bool:
+        """等待 MainActivity 首页脱离「加载中...」并渲染出「开始乐跑」按钮。"""
+        if self.reader is None:
+            time.sleep(3.0)
+            return True
+        end = time.monotonic() + timeout
+        logged_loading = False
+        while time.monotonic() < end:
+            if "MainActivity" not in self._top_activity():
+                return False
+            try:
+                img = self.reader.shot()
+                home_txt = " ".join(self.reader._ocr_crop(img, (100, 700, 980, 1450)))
+                if "开始乐跑" in home_txt:
+                    return True
+                if "加载中" in home_txt and not logged_loading:
+                    self.log("首页仍在「加载中...」，等待界面渲染完成…")
+                    logged_loading = True
+            except Exception:
+                pass
+            time.sleep(1.5)
+        return False
+
+    def _check_run_anomaly(self) -> str | None:
+        """长时间读不到跑步数据时，检查是否弹出「跑步行为异常」等风控终止提示。"""
+        if self.reader is None:
+            return None
+        try:
+            img = self.reader.shot()
+            txt = " ".join(self.reader._ocr_crop(img, (60, 450, 1020, 1550)))
+            if "跑步行为异常" in txt or "行为异常" in txt or "已结束跑步" in txt:
+                return txt
+        except Exception:
+            pass
+        return None
+
     def auto_start_if_needed(self):
         self._ensure_screen_awake()
         top = self._top_activity()
@@ -407,8 +444,9 @@ class CampusRunner:
         if "MainActivity" in top:
             self.c.set_wgs84(*self.default_start)
             self.lat, self.lon = self.default_start
-            time.sleep(1.0)
-            self.log("检测到在乐跑首页，正在自动进入乐跑…")
+            self.log("检测到在乐跑首页，等待首页加载完成…")
+            self._wait_home_ready(timeout=25.0)
+            self.log("首页已就绪，正在自动进入乐跑…")
             entered = False
             for attempt in range(3):
                 if "MainActivity" not in self._top_activity():
@@ -416,14 +454,20 @@ class CampusRunner:
                     if "MapRunActivity" in top:
                         entered = True
                         break
-                # 先确保切到「乐跑」标签页，再点击「开始乐跑」
+                    self._wait_home_ready(timeout=20.0)
+                # 先确保切到「乐跑」标签页，等待按钮就绪后再点击「开始乐跑」
                 self.c.adb_shell("input", "tap", "540", "1833")
                 time.sleep(1.0)
+                self._wait_home_ready(timeout=10.0)
                 self.c.adb_shell("input", "tap", "540", "1209")
-                time.sleep(1.5)
+                time.sleep(2.0)
                 if self.reader is not None:
                     img = self.reader.shot()
                     dlg = " ".join(self.reader._ocr_crop(img, (50, 750, 1030, 1880)))
+                    if "加载中" in dlg and "进入乐跑" not in dlg:
+                        time.sleep(2.5)
+                        img = self.reader.shot()
+                        dlg = " ".join(self.reader._ocr_crop(img, (50, 750, 1030, 1880)))
                     if "暂不开启" in dlg or "必要权限" in dlg or "重要提示" in dlg:
                         self.log("检测到权限提示弹窗，自动点击「暂不开启继续跑步」…")
                         if "重要提示" in dlg:
@@ -447,13 +491,15 @@ class CampusRunner:
                         else:
                             self.c.adb_shell("input", "tap", "344", "1165")
                             raise RuntimeError("当前不在学校规定锻炼时段（弹窗为自由跑），停止自动起跑")
+                    elif "发现新版本" in dlg or "立即更新" in dlg or "版本更新" in dlg:
+                        raise RuntimeError("检测到 App 版本更新弹窗（%s），请使用官方 v4.3.1 版本" % dlg[:80])
                     elif attempt < 2:
-                        self.log("未检测到「进入乐跑」弹窗，尝试返回消除遮挡后重试…")
+                        self.log("未检测到「进入乐跑」弹窗（当前OCR：%s），尝试返回消除遮挡后重试…" % (dlg[:60] or "空"))
                         self.c.adb_shell("input", "keyevent", "4")
                         time.sleep(1.5)
                         continue
                     else:
-                        raise RuntimeError("未能触发「进入乐跑」弹窗，当前可能被弹窗/公告遮挡")
+                        raise RuntimeError("未能触发「进入乐跑」弹窗，当前可能被弹窗/公告遮挡（OCR：%s）" % (dlg[:80] or "空"))
                 else:
                     self.c.adb_shell("input", "tap", "690", "1775")
                 # 等待 MapRunActivity 加载完成
@@ -540,12 +586,25 @@ class CampusRunner:
             self.target_km, self.cp_needed))
         self.last = time.monotonic()
         self.feeder.start()
+        none_since = None
         try:
             while True:
                 st = self.state()
                 if st is None:
+                    now = time.monotonic()
+                    if none_since is None:
+                        none_since = now
+                    elif now - none_since >= 12.0:
+                        anomaly = self._check_run_anomaly()
+                        if anomaly:
+                            raise RuntimeError(
+                                "检测到 App 弹出异常终止提示（%s）。请运行 `python campus_run.py --check` 检查模拟器环境、"
+                                "Android 12 版本、ROOT/模拟定位开关及加速度计步频注入状态。" % anomaly[:80]
+                            )
+                        none_since = now
                     self.move_for(2.0, control=False)
                     continue
+                none_since = None
 
                 if st.punched > self.punched:
                     self.punched = st.punched
@@ -632,6 +691,146 @@ def _android_major_version(ver_str: str) -> int | None:
         return None
 
 
+def _version_tuple(ver_str: str) -> tuple[int, ...] | None:
+    nums = re.findall(r"\d+", str(ver_str or ""))
+    return tuple(int(n) for n in nums[:3]) if nums else None
+
+
+def run_preflight_check(client, vm_index: int = 0, log=lambda s: print(s, flush=True)) -> dict:
+    """启动前环境与设备特征自检（Android 版本、App 版本、ROOT、模拟定位、传感器、设备指纹）。"""
+    warnings: list[str] = []
+    errors: list[str] = []
+    info: dict = {"vm_index": vm_index}
+
+    try:
+        release = client.adb_shell("getprop", "ro.build.version.release").strip()
+    except Exception as exc:
+        err = f"无法通过 ADB 连接到 MuMu 实例 #{vm_index}（{exc}），请确认该实例已启动完成。"
+        log("=" * 56)
+        log(f"[错误] {err}")
+        log("=" * 56)
+        return {"ok": False, "warnings": [], "errors": [err], "info": info}
+
+    def _safe_shell(*cmd_args) -> str:
+        try:
+            return client.adb_shell(*cmd_args).strip()
+        except Exception:
+            return ""
+
+    sdk_raw = _safe_shell("getprop", "ro.build.version.sdk")
+    sdk = int(sdk_raw) if sdk_raw.isdigit() else None
+    abi = _safe_shell("getprop", "ro.product.cpu.abilist")
+    brand = _safe_shell("getprop", "ro.product.brand")
+    model = _safe_shell("getprop", "ro.product.model")
+    hardware = _safe_shell("getprop", "ro.hardware")
+    fingerprint = _safe_shell("getprop", "ro.build.fingerprint")
+    qemu = _safe_shell("getprop", "ro.kernel.qemu")
+    debuggable = _safe_shell("getprop", "ro.debuggable")
+    android_id = _safe_shell("settings", "get", "secure", "android_id")
+    su_path = _safe_shell("which", "su")
+    mock_setting = _safe_shell("settings", "get", "secure", "mock_location")
+    mock_ops = _safe_shell("cmd", "appops", "query-op", "--user", "0", "MOCK_LOCATION", "allow")
+    sensors_dump = _safe_shell("dumpsys", "sensorservice")
+    pkg_dump = _safe_shell("dumpsys", "package", "com.lptiyu.tanke")
+
+    ver_m = re.search(r"versionName=([^\s]+)", pkg_dump)
+    code_m = re.search(r"versionCode=(\d+)", pkg_dump)
+    app_ver = ver_m.group(1) if ver_m else None
+    app_code = int(code_m.group(1)) if code_m else None
+    has_accel = "accelerometer" in sensors_dump.lower()
+
+    try:
+        loc_on = client.location_enabled()
+    except Exception:
+        loc_on = None
+
+    info.update({
+        "android": release,
+        "sdk": sdk,
+        "abi": abi,
+        "brand": brand,
+        "model": model,
+        "hardware": hardware,
+        "fingerprint": fingerprint,
+        "android_id_present": bool(android_id and android_id.lower() != "null"),
+        "app_version": app_ver,
+        "app_version_code": app_code,
+        "root_detected": bool(su_path) or debuggable == "1",
+        "mock_location_active": mock_setting == "1" or (
+            bool(mock_ops) and "no operations" not in mock_ops.lower() and "error" not in mock_ops.lower()
+        ),
+        "has_accelerometer": has_accel,
+        "location_enabled": loc_on,
+    })
+
+    if sdk is not None and sdk >= 35:
+        warnings.append(
+            f"当前系统为 Android {release} (API {sdk})：官方包易因 ART ABI 变更闪退或触发更高风控，"
+            f"强烈建议切换为 MuMu Android 12 实例。"
+        )
+
+    if not app_ver:
+        errors.append("未检测到步道乐跑 (com.lptiyu.tanke)，请在 MuMu Android 12 实例中安装官方 v4.3.1。")
+    else:
+        vt = _version_tuple(app_ver)
+        if (app_code is not None and app_code >= 233) or (vt is not None and vt >= (4, 3, 3)):
+            warnings.append(
+                f"检测到步道乐跑 v{app_ver} (versionCode={app_code})：4.3.3+ 新增 libkadp.so 壳与 KwProtectSDK "
+                f"模拟器检测（UniverseSecNo2 -> SIGKILL），即使在 Android 12 + DirectX + 关闭 ROOT 下官方原版也会闪退！"
+                f"建议卸载后安装官方历史版本 v4.3.1 (versionCode=231)。"
+            )
+        elif (app_code is not None and app_code <= 226) or (vt is not None and vt <= (4, 2, 6)):
+            warnings.append(
+                f"检测到步道乐跑旧版 v{app_ver} (versionCode={app_code})：服务端已强制弹窗要求更新，"
+                f"建议安装官方 v4.3.1 (versionCode=231)。"
+            )
+
+    if info["root_detected"]:
+        warnings.append("检测到 ROOT 或调试模式（su/ro.debuggable=1），易触发风控或闪退，请在 MuMu 设置中关闭 ROOT。")
+
+    if info["mock_location_active"]:
+        warnings.append(
+            "检测到系统启用了模拟定位（Mock Location / addTestProvider）：定位会携带 isFromMockProvider 标记，"
+            "极易在跑步数分钟后触发「跑步行为异常」。请关闭第三方模拟定位，仅使用本项目 MuMu 网关定位 + 步频脉冲。"
+        )
+
+    emu_tokens = ("generic", "goldfish", "ranchu", "vbox", "sdk_gphone", "emulator", "test-keys")
+    fp_blob = f"{brand} {model} {hardware} {fingerprint}".lower()
+    if qemu == "1" or any(tok in fp_blob for tok in emu_tokens) or not info["android_id_present"]:
+        warnings.append(
+            f"设备特征疑似暴露模拟器标识（brand={brand!r}, model={model!r}, hw={hardware!r}, qemu={qemu!r}），"
+            f"建议在 MuMu 设备设置中选择常见真机型号并生成随机 IMEI。"
+        )
+
+    if not has_accel:
+        warnings.append(
+            "未检测到加速度计传感器（TYPE_ACCELEROMETER）：步数为 0 / MAD 静止会触发「跑步行为异常」，"
+            "请确认模拟器传感器正常并保持 StepFeeder 摇一摇步频注入开启。"
+        )
+
+    if loc_on is False:
+        warnings.append("模拟器定位总开关未开启（脚本运行前将自动尝试开启）。")
+
+    log("=" * 56)
+    log(
+        f"[自检] 实例 #{vm_index} | Android {release or '?'} (API {sdk or '?'}) | "
+        f"步道乐跑 {app_ver or '未安装'} (code={app_code or '?'})"
+    )
+    log(
+        f"[自检] 机型: {brand or '?'} {model or '?'} | ROOT: {'是' if info['root_detected'] else '否'} | "
+        f"Mock定位: {'是' if info['mock_location_active'] else '否'} | "
+        f"加速度计: {'正常' if has_accel else '异常'} | GPS开关: {'开' if loc_on else '关'}"
+    )
+    for err in errors:
+        log(f"[错误] {err}")
+    for w in warnings:
+        log(f"[警告] {w}")
+    if not errors and not warnings:
+        log("[自检] ✔ 全部关键项通过（Android 12 + v4.3.1 + 无ROOT + 无Mock标记 + 传感器正常）")
+    log("=" * 56)
+    return {"ok": len(errors) == 0, "warnings": warnings, "errors": errors, "info": info}
+
+
 def main():
     ap = argparse.ArgumentParser(description="校园定向打卡 + 配速闭环")
     ap.add_argument("--pace", type=float, default=6.0, help="目标平均配速，分钟/公里（默认 6.0）")
@@ -642,9 +841,11 @@ def main():
     ap.add_argument("--start-lat", type=float, default=None, help="起始点纬度（WGS-84，默认读环境变量 LEPAO_START_LAT 或内置示例）")
     ap.add_argument("--start-lon", type=float, default=None, help="起始点经度（WGS-84，默认读环境变量 LEPAO_START_LON 或内置示例）")
     ap.add_argument("--vm-index", type=int, default=None, help="MuMu 模拟器多开实例编号（默认读环境变量 MUMU_VM_INDEX，未设置则为 0）")
+    ap.add_argument("--check", action="store_true", help="仅执行启动前环境与设备特征自检，不启动跑步")
+    ap.add_argument("--skip-check", action="store_true", help="跳过启动前环境与设备特征自检")
     args = ap.parse_args()
 
-    _lock_fh = _acquire_run_lock()
+    _lock_fh = None if args.check else _acquire_run_lock()
 
     vm_index = args.vm_index if args.vm_index is not None else int(os.environ.get("MUMU_VM_INDEX", "0"))
     os.environ["MUMU_VM_INDEX"] = str(vm_index)
@@ -673,9 +874,12 @@ def main():
             adb_port = info.get("adb_port") or adb_port
             if not info.get("is_android_started"):
                 ver_label = f"Android {android_ver}" if android_ver else "Android"
-                print(f"正在唤醒 MuMu 模拟器实例 #{vm_index} ({ver_label})…", flush=True)
-                subprocess.run([manager, "control", "-v", str(vm_index), "launch"], capture_output=True, timeout=15)
-                for _ in range(45):
+                if not info.get("is_process_started"):
+                    print(f"正在唤醒 MuMu 模拟器实例 #{vm_index} ({ver_label})…", flush=True)
+                    subprocess.run([manager, "control", "-v", str(vm_index), "launch"], capture_output=True, timeout=30)
+                else:
+                    print(f"MuMu 模拟器实例 #{vm_index} ({ver_label}) 正在启动中，等待就绪…", flush=True)
+                for _ in range(60):
                     time.sleep(2)
                     chk = subprocess.run([manager, "info", "-v", str(vm_index)], capture_output=True, text=True,
                                          encoding="utf-8", errors="replace", timeout=15)
@@ -704,6 +908,13 @@ def main():
             time.sleep(2)
 
     client = MuMuLocationClient(vm_index=vm_index, manager_path=manager)
+    if args.check:
+        res = run_preflight_check(client, vm_index=vm_index)
+        raise SystemExit(0 if res["ok"] else 1)
+    if not args.skip_check:
+        res = run_preflight_check(client, vm_index=vm_index)
+        if not res["ok"]:
+            raise RuntimeError("启动前自检未通过：%s" % "；".join(res["errors"]))
     client.ensure_gps_enabled()
     runner = CampusRunner(client, args.pace, args.km, args.cps,
                           auto_start=args.auto_start, auto_finish=args.auto_finish,
@@ -717,10 +928,11 @@ def main():
             runner.watcher.stop()
         print("\n已中断，定位停留在当前位置。")
     finally:
-        try:
-            _lock_fh.close()
-        except Exception:
-            pass
+        if _lock_fh is not None:
+            try:
+                _lock_fh.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
